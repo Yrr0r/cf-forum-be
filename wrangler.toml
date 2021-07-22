@@ -1,0 +1,16 @@
+name = "testforum"
+type = "javascript"
+workers_dev = true
+# Add your account ID here
+account_id = "06db6faee5c70d1d272b2c5b954633c8"
+
+[build.upload]
+format = "modules"
+dir = "src"
+main = "./main.mjs"
+rules = [{type = "Data", globs = ["**/*.html"]}]
+
+[durable_objects]
+bindings = [
+	{ name = "threaddb", class_name = "ThreadDB"}
+]

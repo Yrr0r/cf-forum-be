@@ -1,0 +1,7 @@
+{
+  "name": "edge-forum",
+  "description": "Forum powered by Durable Objects",
+  "version": "1.0.0",
+  "module": "./src/main.mjs",
+  "private": true
+}
