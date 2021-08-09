@@ -1,11 +1,17 @@
 // the discuss handler
 
+// coop with other modules
+import {registerThread} from 'listing.mjs';
+import {authCode} from 'uauth.mjs';
+
+
+// main handler
 export async function handleDiscuss(request, env){
 
 	try {
 		var task = await request.json();
 	} catch(err){
-		return new Response("Invalid request.\n" + err.stack); // catch error
+		return new Response("Error: Cannot parse. \n" + err.stack); // catch error
 	}
 	
 	// switching methods:
@@ -15,8 +21,10 @@ export async function handleDiscuss(request, env){
 		return createThread(task, env);
 	} else if(task.method == 'reply'){
 		return replyThread(task, env);
-	}
-	// todo: handle other exception accesses
+	} // todo: need delete method
+
+	// Block broken request:
+	return new Response("Error: Method must be specified.", {status: 404})
 }
 
 async function readThread(task, env){
@@ -32,8 +40,15 @@ async function readThread(task, env){
 		// current: replying last 100 messages.
 		//return new Response("Error: Must specify a range.", {status:404});
 	}
-	//todo: permcode checks
-	//
+	// put permcode into message.
+	let priv = 254;
+	if(task['perm'] != undefined){
+		let permcode = task['perm'];
+		let result = await authCode(permcode, env);
+		if(!(result < 0)){
+			priv = result['priv'];
+		}
+	}
 
 	//get object stub for db access
 	let id;
@@ -45,10 +60,11 @@ async function readThread(task, env){
 	let stub = env.threaddb.get(id);
 
 	//putting together a request
-	let taskstr = JSON.stringify({"range": task['range']});// task['range'] checked before.
+	let taskstr = JSON.stringify({'priv': priv, "range": task['range']});// task['range'] checked before.
 	let req = new Request('read', {method:"POST", body:taskstr});
 	let response = await stub.fetch(req)
-	return new Response(await response.text());
+
+	return new Response(response.body, response);
 }
 
 async function createThread(task, env){
@@ -58,25 +74,45 @@ async function createThread(task, env){
 		return new Response("Error: You must specify a title.", {status: 404});
 	}
 	//todo: USER AUTH here, query db and verify user.
-	// user auth finally gets creatorId on success or fail with 404.
-	let creatorId = -1;
+	let perm;
+	let creatorId;
+	if(task['perm'] != undefined){ //otherwise see it as guest
+		// send permcode to auth.
+		let result = await authCode(task['perm'], env);
+		if(result['priv'] != undefined){
+			perm = result['priv'];
+			creatorId = result['uid'];
+			if(perm > 250){
+				return new Response('Insufficient priviledge.', {status:404});
+			}
+		}
+	} else {
+		return new Response('Please login first.', {status: 404});
+	}
 
 	// putting together the request that will be forwarded to Durable Object.
-	let posttxt = JSON.stringify({"creatorId": creatorId, "title": task['topicname'], "properties": "", "firstpost": task['firstpost']});
-	console.log(`Sent to Object: ${posttxt}`);
-	let req = new Request('create', {method:"POST", body:posttxt});
+	let properties = {priv: task['properties']['priv']};
+	let postdat = {"creatorId": creatorId, "title": task['topicname'], "properties": properties, "firstpost": task['firstpost']};
+	let req = new Request('create', {method:"POST", body:JSON.stringify(postdat)});
+	console.log(`Sent to Object: ${JSON.stringify(postdat)}`);
 
 	// summon new durable object
 	let id = env.threaddb.newUniqueId(); // generate new id
 	let stub = env.threaddb.get(id); // obtain its stub
 
-	// forward request
+	// forward request & get response
 	let response = await stub.fetch(req);
 
-	//return response;
-	let resptext = await response.text();
-	console.log(resptext);
-	return new Response(id.toString() + ' ' +  resptext);
+	// on success register new node to list
+	if(response.ok == true){
+		let abstractData = {'id': id.toString(), 'metadata': postdat };
+		console.log('Send to listing: ' + JSON.stringify(abstractData) );
+		let result = await registerThread(abstractData, env); 
+		console.log('Register Result:\n' + await result.text());
+	}
+
+	return new Response(response.body, response);
+
 }
 
 async function replyThread(task, env){
@@ -87,9 +123,16 @@ async function replyThread(task, env){
 	if(task['messageObj'] == undefined){
 		return new Response("messageObj not declared.", {status:404})
 	}
-	//todo: uAuth for reply
-	// should support uid/pas and maybe another quicker way.
-
+	//uAuth for reply, done by permcode check.
+	let perm = 254;
+	if(task['perm'] && task['perm'].length > 3){ //otherwise see it as guest
+		// send permcode to auth.
+		let result = await authCode(task['perm'], env);
+		if(result['priv'] != undefined){
+			perm = result['priv'];
+		}
+	}
+	// do the work.
 	let id;
 	try{
 		id = env.threaddb.idFromString(task['threadId']);
@@ -98,12 +141,11 @@ async function replyThread(task, env){
 	}
 	let stub = env.threaddb.get(id);
 
-	let taskstr = JSON.stringify({messageObj: task['messageObj']});
+	let taskstr = JSON.stringify({perm: perm, messageObj: task['messageObj']});
 	let req = new Request('reply', {method:"POST", body:taskstr});
 
 	let response = await stub.fetch(req); // send request
-	let resptext = await response.text(); // get returned text
-	return new Response(resptext);
+	return new Response(response.body, response);
 
 }
 
@@ -111,19 +153,36 @@ async function replyThread(task, env){
 // Define Durable object class
 export class ThreadDB {
 	constructor(state, env){
-		//this.state = state;
+		this.state = state;
 		this.storage = state.storage;
 		this.env = env;
 	}
 
 	async initialize(){
 		// put post countings into object's memory.
-		let lastpost = await this.storage.list({prefix: 'post-', limit: 1});
+		let lastpost = await this.storage.list({prefix: 'post-', limit: 1, reverse: true});
 		let postkey = Array.from(lastpost.keys())[0]; //get the only key name in this map.
 		if(postkey == undefined){
 			this.postcount = -1; // set to -1 for newly created objects.
 		} else {
 			this.postcount = parseInt(postkey.substring(5)); // remove the prefix and parse the Int.
+		}
+		// put metadata of this post into object's memory.
+		let meta = await this.storage.get('meta');
+		if(meta != undefined){ //undefined when object is newly created.
+			this.meta = meta;
+			// put properties in.
+			let properties = meta['properties'];
+			if(properties != undefined && properties['priv'] != undefined){
+				let permlvl = properties['priv'];
+				if(typeof(permlvl) == 'number'){
+					this.permlvl = [255, permlvl];
+				} else {
+					this.permlvl = permlvl;
+				}
+			} else {
+				this.permlvl = [256, 256]; // [r, w]
+			}
 		}
 	}
 
@@ -150,24 +209,56 @@ export class ThreadDB {
 		if(path == '/create'){
 			//create new discussion
 			let metainfo = {"creatorId": task['creatorId'], "title": task['title'], "properties": task['properties']};
-			//let storeObj = new Map();
-			//storeObj.set('meta', metainfo);
-			//storeObj.set('1', task['firstpost']);
+
 			// DB transaction process
 			try {
 				this.storage.put('meta', metainfo);
 				this.storage.put('post-1', task["firstpost"]);
 				this.postcount = 1; // Add 1 to postcount.
-				return new Response("OK, " + this.postcount);
 			} catch(err){
 				return new Response(err.stack, {status: 404});
 			}
+			// set metadata for this object:
+			this.meta = metainfo;
+			// put properties in.
+			let properties = metainfo['properties'];
+			if(properties != undefined && properties['priv'] != undefined){
+				let permlvl = properties['priv'];
+				if(typeof(permlvl) == 'number'){
+					this.permlvl = [255, permlvl];
+				} else {
+					this.permlvl = permlvl;
+				}
+			} else {
+				this.permlvl = [256, 256]; // [r, w]
+			}
+			
+			let status = {id:(this.state.id.toString()), status: "OK", postcount: this.postcount};
+			return new Response(JSON.stringify(status));
 
 		} else if (path == '/read'){
 			//read a discussion
+			//permission check
+			let readprm = this.permlvl[0]; // [r,w]
+			if(task['priv'] != undefined){
+				if(task['priv'] > readprm){
+					return new Response('Insufficient Priviledge', {status:404});
+				}
+			} else {
+				return new Response('Priviledge not declared.', {status:404});
+			}
+
+			let range = task['range'];
+			let start, limit;
+			if(range == undefined){
+				start = 0; limit = 50;
+			} else if (range.length != 2){
+				return new Response("Range error",{status: 404});
+			}
+
 			let list;
 			try{
-				list = await this.storage.list();
+				list = await this.storage.list({start: start, limit: limit});
 			}catch(err){
 				return new Response(err.stack, {status:404});
 			}
@@ -175,7 +266,12 @@ export class ThreadDB {
 			return new Response(JSON.stringify(Object.fromEntries(list)));
 
 		} else if (path == '/reply'){
-			console.log(`Postcount Before: ${this.postcount}`);
+			// check perm
+			let writeprm = this.permlvl[1];
+			let currperm = task['perm'];
+			if(currperm == undefined || currperm > writeprm){
+				return new Response('Insufficient priveledge or not declared.', {status: 404});
+			}
 			// reply to a discussion (append a msg)
 			let msg = task['messageObj'];
 			let keyname = 'post-' + (this.postcount + 1); //since its the next post, not this last one.

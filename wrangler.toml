@@ -4,13 +4,25 @@ workers_dev = true
 # Add your account ID here
 #account_id = ""
 
+kv_namespaces = [
+	{ binding = "kvdb", id = "7f16e9fb8e094e978ac3fd1c431a321b", preview_id = "7f16e9fb8e094e978ac3fd1c431a321b" }
+]
+
+[durable_objects]
+bindings = [
+	{ name = "threaddb", class_name = "ThreadDB"},
+	{ name = "listings", class_name = "ListingsDB"}
+]
+
 [build.upload]
 format = "modules"
 dir = "src"
 main = "./main.mjs"
 rules = [{type = "Data", globs = ["**/*.html"]}]
 
-[durable_objects]
-bindings = [
-	{ name = "threaddb", class_name = "ThreadDB"}
-]
+[vars]
+AUTH_ENC_KEY="2WqtX5YlhMZfp2iE"
+
+
+
+
